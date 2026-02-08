@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3
 """
 Ghostty Keybindings Reference Tool
 A beautiful, searchable reference for YOUR Ghostty keybindings.
