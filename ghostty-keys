@@ -1,0 +1,753 @@
+#!/usr/bin/env python3
+"""
+Ghostty Keybindings Reference Tool
+A beautiful, searchable reference for YOUR Ghostty keybindings.
+
+Reads your actual keybindings from `ghostty +list-keybinds`
+Understands ALL actions dynamically - no hardcoding needed!
+
+Usage:
+    ghostty-keys              # Interactive mode with full UI
+    ghostty-keys <query>      # Quick search mode
+    ghostty-keys --list       # List all categories
+    ghostty-keys --all        # Show all keybindings
+"""
+
+import subprocess
+import sys
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+
+# Try to import rich for beautiful output
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.prompt import Prompt
+    from rich.box import ROUNDED, DOUBLE
+    from rich.align import Align
+    from rich.markdown import Markdown
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+    print("For beautiful output: pip install rich")
+    print("Falling back to plain text mode...\n")
+
+
+@dataclass
+class Keybinding:
+    """A single keybinding with its details."""
+    key: str
+    action: str
+    category: str
+    description: str = ""
+    keywords: List[str] = field(default_factory=list)
+
+
+# Category detection rules: (pattern, category, description_template)
+CATEGORY_RULES = [
+    # Window operations
+    (r"^(new_window|close_window|close_all_windows|toggle_fullscreen|quit|toggle_visibility|reset_window_size|toggle_window_float_on_top|toggle_maximize|toggle_window_decorations)$",
+     "Window", None),
+
+    # Tab operations
+    (r"^(new_tab|close_tab|close_surface|previous_tab|next_tab|goto_tab|last_tab|move_tab|toggle_tab_overview|prompt_surface_title)$",
+     "Tabs", None),
+
+    # Split operations
+    (r"^(new_split|goto_split|resize_split|toggle_split_zoom|equalize_splits)$",
+     "Splits", None),
+
+    # Clipboard operations
+    (r"^(copy_to_clipboard|paste_from_clipboard|paste_from_selection|select_all|copy_url_to_clipboard|copy_title_to_clipboard|copy|paste)$",
+     "Clipboard", None),
+
+    # Scrolling operations
+    (r"^(scroll_to_top|scroll_to_bottom|scroll_page_up|scroll_page_down|scroll_page_fractional|scroll_page_lines|scroll_to_selection|jump_to_prompt)$",
+     "Scrolling", None),
+
+    # Selection operations
+    (r"^adjust_selection$", "Selection", None),
+
+    # Font operations
+    (r"^(increase_font_size|decrease_font_size|reset_font_size|set_font_size)$",
+     "Font", None),
+
+    # Screen operations
+    (r"^(clear_screen|reset|write_scrollback_file|write_screen_file|write_selection_file)$",
+     "Screen", None),
+
+    # Config operations
+    (r"^(open_config|reload_config|inspector|toggle_command_palette|toggle_quick_terminal|show_gtk_inspector|show_on_screen_keyboard|check_for_updates|toggle_secure_input)$",
+     "Config", None),
+
+    # Undo operations
+    (r"^(undo|redo)$", "Undo", None),
+
+    # Text/escape sequences
+    (r"^(text|esc|csi|cursor_key)$", "Text", None),
+
+    # Special
+    (r"^(ignore|unbind)$", "Special", None),
+]
+
+# Human-readable action descriptions
+ACTION_DESCRIPTIONS = {
+    # Window
+    "new_window": "Open a new window",
+    "close_window": "Close current window",
+    "close_all_windows": "Close all windows",
+    "toggle_fullscreen": "Toggle fullscreen",
+    "quit": "Quit Ghostty",
+    "toggle_visibility": "Hide/show all windows",
+    "reset_window_size": "Reset window size",
+    "toggle_window_float_on_top": "Float window on top",
+    "toggle_maximize": "Toggle maximize",
+    "toggle_window_decorations": "Toggle window decorations",
+
+    # Tabs
+    "new_tab": "Open new tab",
+    "close_surface": "Close tab/split",
+    "close_tab": "Close tab",
+    "previous_tab": "Previous tab",
+    "next_tab": "Next tab",
+    "goto_tab": "Go to tab",
+    "last_tab": "Go to last tab",
+    "move_tab": "Move tab",
+    "toggle_tab_overview": "Show tab overview",
+    "prompt_surface_title": "Rename tab",
+
+    # Splits
+    "new_split": "New split",
+    "goto_split": "Navigate to split",
+    "resize_split": "Resize split",
+    "toggle_split_zoom": "Zoom/unzoom split",
+    "equalize_splits": "Equalize all splits",
+
+    # Clipboard
+    "copy_to_clipboard": "Copy to clipboard",
+    "paste_from_clipboard": "Paste from clipboard",
+    "paste_from_selection": "Paste from selection",
+    "select_all": "Select all",
+    "copy_url_to_clipboard": "Copy URL to clipboard",
+    "copy_title_to_clipboard": "Copy title to clipboard",
+    "copy": "Copy",
+    "paste": "Paste",
+
+    # Scrolling
+    "scroll_to_top": "Scroll to top",
+    "scroll_to_bottom": "Scroll to bottom",
+    "scroll_page_up": "Scroll page up",
+    "scroll_page_down": "Scroll page down",
+    "scroll_to_selection": "Scroll to selection",
+    "jump_to_prompt": "Jump to prompt",
+
+    # Selection
+    "adjust_selection": "Adjust selection",
+
+    # Font
+    "increase_font_size": "Increase font size",
+    "decrease_font_size": "Decrease font size",
+    "reset_font_size": "Reset font size",
+    "set_font_size": "Set font size",
+
+    # Screen
+    "clear_screen": "Clear screen",
+    "reset": "Reset terminal",
+    "write_scrollback_file": "Save scrollback to file",
+    "write_screen_file": "Save screen to file",
+    "write_selection_file": "Save selection to file",
+
+    # Config
+    "open_config": "Open config file",
+    "reload_config": "Reload config",
+    "inspector": "Toggle inspector",
+    "toggle_command_palette": "Command palette",
+    "toggle_quick_terminal": "Toggle quick terminal",
+    "toggle_secure_input": "Toggle secure input",
+
+    # Undo
+    "undo": "Undo",
+    "redo": "Redo",
+
+    # Text
+    "text": "Send text",
+    "esc": "Send escape sequence",
+    "csi": "Send CSI sequence",
+
+    # Special
+    "ignore": "Ignore key",
+    "unbind": "Unbind key",
+}
+
+# Category styling
+CATEGORIES = {
+    "Window": {"color": "bright_blue", "icon": "🪟", "order": 1},
+    "Tabs": {"color": "bright_green", "icon": "📑", "order": 2},
+    "Splits": {"color": "bright_magenta", "icon": "⬛", "order": 3},
+    "Clipboard": {"color": "bright_yellow", "icon": "📋", "order": 4},
+    "Selection": {"color": "yellow", "icon": "✂️", "order": 5},
+    "Scrolling": {"color": "bright_cyan", "icon": "📜", "order": 6},
+    "Font": {"color": "bright_white", "icon": "🔤", "order": 7},
+    "Screen": {"color": "bright_red", "icon": "🖥️", "order": 8},
+    "Config": {"color": "orange1", "icon": "⚙️", "order": 9},
+    "Undo": {"color": "purple", "icon": "↩️", "order": 10},
+    "Text": {"color": "dim", "icon": "📝", "order": 11},
+    "Special": {"color": "dim", "icon": "🔧", "order": 12},
+    "Other": {"color": "white", "icon": "•", "order": 99},
+}
+
+
+def format_key(key: str) -> str:
+    """Format key for display with nicer symbols."""
+    replacements = {
+        "super": "⌘",
+        "alt": "⌥",
+        "ctrl": "⌃",
+        "shift": "⇧",
+        "arrow_up": "↑",
+        "arrow_down": "↓",
+        "arrow_left": "←",
+        "arrow_right": "→",
+        "page_up": "PgUp",
+        "page_down": "PgDn",
+        "backquote": "`",
+        "bracket_left": "[",
+        "bracket_right": "]",
+        "backslash": "\\",
+        "equal": "=",
+        "minus": "-",
+        "plus": "+",
+        "digit_": "",
+        "enter": "↵",
+        "home": "Home",
+        "end": "End",
+    }
+
+    result = key
+    for old, new in replacements.items():
+        result = result.replace(old, new)
+
+    # Handle chord sequences (a>b)
+    if ">" in result:
+        parts = result.split(">")
+        formatted_parts = []
+        for part in parts:
+            subparts = part.split("+")
+            if len(subparts) > 1:
+                subparts[-1] = subparts[-1].upper() if len(subparts[-1]) == 1 else subparts[-1]
+            formatted_parts.append(" ".join(subparts))
+        return " → ".join(formatted_parts)
+
+    # Clean up + signs for modifiers
+    parts = result.split("+")
+    if len(parts) > 1:
+        parts[-1] = parts[-1].upper() if len(parts[-1]) == 1 else parts[-1]
+        result = " ".join(parts)
+
+    return result
+
+
+def detect_category(action_name: str) -> str:
+    """Detect category from action name."""
+    for pattern, category, _ in CATEGORY_RULES:
+        if re.match(pattern, action_name):
+            return category
+    return "Other"
+
+
+def generate_description(action_name: str, param: str) -> str:
+    """Generate human-readable description for an action."""
+    # Check known descriptions
+    if action_name in ACTION_DESCRIPTIONS:
+        base = ACTION_DESCRIPTIONS[action_name]
+        if param:
+            # Format parameter nicely
+            param_display = param.replace("_", " ").replace("-", " ")
+            # Handle special cases
+            if action_name == "goto_tab":
+                return f"{base} #{param}"
+            elif action_name == "goto_split":
+                return f"Go to {param} split"
+            elif action_name == "new_split":
+                return f"Split {param}"
+            elif action_name == "resize_split":
+                parts = param.split(",")
+                direction = parts[0] if parts else param
+                return f"Resize split {direction}"
+            elif action_name == "jump_to_prompt":
+                if param.startswith("-"):
+                    return "Jump to previous prompt"
+                else:
+                    return "Jump to next prompt"
+            elif action_name == "adjust_selection":
+                return f"Adjust selection {param}"
+            elif action_name == "write_scrollback_file":
+                return f"Save scrollback ({param})"
+            elif action_name == "write_screen_file":
+                return f"Save screen ({param})"
+            elif action_name == "inspector":
+                return "Toggle inspector"
+            else:
+                return f"{base} ({param_display})"
+        return base
+
+    # Generate from action name
+    readable = action_name.replace("_", " ").title()
+    if param:
+        readable += f" ({param})"
+    return readable
+
+
+def generate_keywords(action_name: str, param: str) -> List[str]:
+    """Generate search keywords from action."""
+    keywords = []
+
+    # Split action name into words
+    words = action_name.split("_")
+    keywords.extend(words)
+
+    # Add common synonyms
+    synonyms = {
+        "new": ["create", "open", "add"],
+        "close": ["kill", "exit", "quit", "end"],
+        "toggle": ["switch", "enable", "disable"],
+        "goto": ["go", "jump", "navigate", "switch"],
+        "previous": ["prev", "back", "left", "before"],
+        "next": ["forward", "right", "after"],
+        "increase": ["bigger", "larger", "zoom", "in", "grow"],
+        "decrease": ["smaller", "zoom", "out", "shrink"],
+        "split": ["pane", "divide", "tile"],
+        "tab": ["buffer"],
+        "scroll": ["page"],
+        "copy": ["yank", "clipboard"],
+        "paste": ["put", "insert"],
+        "font": ["text", "size"],
+        "clear": ["clean", "erase", "reset"],
+        "config": ["settings", "preferences"],
+        "window": ["screen"],
+        "resize": ["size", "grow", "shrink"],
+    }
+
+    for word in words:
+        if word in synonyms:
+            keywords.extend(synonyms[word])
+
+    # Add parameter as keyword
+    if param:
+        keywords.extend(param.replace(",", " ").split())
+
+    return list(set(keywords))
+
+
+def parse_keybinding_line(line: str) -> Tuple[str, str]:
+    """Parse a keybinding line into key and action."""
+    # Format: keybind = key=action
+    match = re.match(r"keybind\s*=\s*(.+?)=(.+)", line)
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return "", ""
+
+
+def get_keybindings() -> List[Keybinding]:
+    """Get keybindings from ghostty CLI."""
+    lines = []
+
+    try:
+        result = subprocess.run(
+            ["ghostty", "+list-keybinds"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        lines = result.stdout.strip().split("\n")
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        # Fallback: read from config
+        import os
+        config_path = os.path.expanduser("~/.config/ghostty/config")
+        try:
+            with open(config_path) as f:
+                lines = [l.strip() for l in f if l.strip().startswith("keybind")]
+        except FileNotFoundError:
+            return []
+
+    keybindings = []
+    seen = set()
+
+    for line in lines:
+        key, action_full = parse_keybinding_line(line)
+        if not key or not action_full:
+            continue
+
+        # Skip duplicates
+        key_action = f"{key}={action_full}"
+        if key_action in seen:
+            continue
+        seen.add(key_action)
+
+        # Parse action (may have parameters like :right or :1)
+        action_parts = action_full.split(":", 1)
+        action_name = action_parts[0]
+        param = action_parts[1] if len(action_parts) > 1 else ""
+
+        # Detect category
+        category = detect_category(action_name)
+
+        # Generate description
+        description = generate_description(action_name, param)
+
+        # Generate keywords
+        keywords = generate_keywords(action_name, param)
+
+        kb = Keybinding(
+            key=key,
+            action=action_full,
+            category=category,
+            description=description,
+            keywords=keywords
+        )
+        keybindings.append(kb)
+
+    return keybindings
+
+
+def fuzzy_match(query: str, text: str) -> float:
+    """Simple fuzzy matching score (0-1)."""
+    query = query.lower()
+    text = text.lower()
+
+    if query == text:
+        return 1.0
+    if query in text:
+        return 0.9
+
+    query_words = query.split()
+    matches = sum(1 for w in query_words if w in text)
+    if query_words:
+        return matches / len(query_words) * 0.8
+
+    return 0.0
+
+
+def semantic_search(query: str, keybindings: List[Keybinding]) -> List[tuple]:
+    """Search keybindings semantically."""
+    results = []
+    query_lower = query.lower()
+    query_words = set(query_lower.split())
+
+    for kb in keybindings:
+        score = 0.0
+
+        # Check key combination (highest priority)
+        formatted_key = format_key(kb.key).lower()
+        if query_lower in kb.key.lower() or query_lower in formatted_key:
+            score = max(score, 0.98)
+
+        # Check action name
+        if query_lower in kb.action.lower():
+            score = max(score, 0.95)
+
+        # Check description
+        desc_score = fuzzy_match(query, kb.description)
+        score = max(score, desc_score * 0.9)
+
+        # Check keywords
+        keyword_matches = sum(1 for kw in kb.keywords if any(qw in kw or kw in qw for qw in query_words))
+        if keyword_matches > 0:
+            keyword_score = min(keyword_matches / len(query_words) if query_words else 0, 1.0) * 0.85
+            score = max(score, keyword_score)
+
+        # Check category
+        if query_lower in kb.category.lower():
+            score = max(score, 0.6)
+
+        if score > 0.2:
+            results.append((score, kb))
+
+    results.sort(key=lambda x: (-x[0], x[1].key))
+    return results
+
+
+class GhosttyKeysApp:
+    """Main application."""
+
+    def __init__(self):
+        self.console = Console() if RICH_AVAILABLE else None
+        self.keybindings = get_keybindings()
+
+    def print_header(self):
+        """Print app header."""
+        if not RICH_AVAILABLE:
+            print("=" * 60)
+            print("  👻 GHOSTTY KEYBINDINGS REFERENCE")
+            print(f"  {len(self.keybindings)} keybindings loaded")
+            print("=" * 60)
+            return
+
+        header = Text()
+        header.append("👻 ", style="bold")
+        header.append("GHOSTTY", style="bold bright_white")
+        header.append(" KEYBINDINGS", style="bold cyan")
+
+        panel = Panel(
+            Align.center(header),
+            subtitle=f"{len(self.keybindings)} keybindings loaded",
+            box=DOUBLE,
+            style="cyan",
+            padding=(0, 2)
+        )
+        self.console.print(panel)
+        self.console.print()
+
+    def print_category(self, category: str, keybindings: List[Keybinding]):
+        """Print keybindings for a category."""
+        cat_info = CATEGORIES.get(category, {"color": "white", "icon": "•"})
+
+        if not RICH_AVAILABLE:
+            print(f"\n{cat_info['icon']} {category.upper()}")
+            print("-" * 60)
+            for kb in keybindings:
+                key_fmt = format_key(kb.key)
+                print(f"  {key_fmt:<24} {kb.description}")
+            return
+
+        table = Table(
+            show_header=True,
+            header_style=f"bold {cat_info['color']}",
+            box=ROUNDED,
+            title=f"{cat_info['icon']} {category}",
+            title_style=f"bold {cat_info['color']}",
+            expand=True,
+            padding=(0, 1)
+        )
+
+        table.add_column("Key", style="bold yellow", width=24)
+        table.add_column("Action", style="cyan", width=30)
+        table.add_column("Description", style="white")
+
+        for kb in keybindings:
+            key_fmt = format_key(kb.key)
+            table.add_row(key_fmt, kb.action, kb.description)
+
+        self.console.print(table)
+        self.console.print()
+
+    def print_search_results(self, query: str, results: List[tuple]):
+        """Print search results."""
+        if not results:
+            msg = f"No results for '{query}'. Try: split, copy, tab, zoom, font, navigate, vim"
+            if RICH_AVAILABLE:
+                self.console.print(f"[red]{msg}[/red]")
+            else:
+                print(msg)
+            return
+
+        if not RICH_AVAILABLE:
+            print(f"\n🔍 Results for '{query}':")
+            print("-" * 60)
+            for score, kb in results[:15]:
+                key_fmt = format_key(kb.key)
+                print(f"  {key_fmt:<24} {kb.description}")
+                print(f"    → {kb.action}")
+            return
+
+        table = Table(
+            show_header=True,
+            header_style="bold magenta",
+            box=ROUNDED,
+            title=f"🔍 Results for '{query}'",
+            title_style="bold magenta",
+            expand=True
+        )
+
+        table.add_column("Key", style="bold yellow", width=24)
+        table.add_column("Category", width=12)
+        table.add_column("Action", style="cyan", width=30)
+        table.add_column("Description")
+        table.add_column("", justify="right", width=5)
+
+        for score, kb in results[:15]:
+            key_fmt = format_key(kb.key)
+            cat_info = CATEGORIES.get(kb.category, {"color": "white", "icon": "•"})
+            match_pct = f"{int(score * 100)}%"
+
+            if score >= 0.8:
+                match_style = "bold green"
+            elif score >= 0.6:
+                match_style = "yellow"
+            else:
+                match_style = "dim"
+
+            table.add_row(
+                key_fmt,
+                Text(f"{cat_info['icon']} {kb.category}", style=cat_info['color']),
+                kb.action,
+                kb.description,
+                Text(match_pct, style=match_style)
+            )
+
+        self.console.print(table)
+        self.console.print()
+
+    def print_all(self):
+        """Print all keybindings by category."""
+        by_category: Dict[str, List[Keybinding]] = {}
+        for kb in self.keybindings:
+            if kb.category not in by_category:
+                by_category[kb.category] = []
+            by_category[kb.category].append(kb)
+
+        sorted_cats = sorted(
+            by_category.keys(),
+            key=lambda c: CATEGORIES.get(c, {"order": 99})["order"]
+        )
+
+        for cat in sorted_cats:
+            self.print_category(cat, by_category[cat])
+
+    def print_categories(self):
+        """List all categories."""
+        by_category: Dict[str, int] = {}
+        for kb in self.keybindings:
+            by_category[kb.category] = by_category.get(kb.category, 0) + 1
+
+        if not RICH_AVAILABLE:
+            print("\n📚 Categories:")
+            for cat, count in sorted(by_category.items()):
+                info = CATEGORIES.get(cat, {"icon": "•"})
+                print(f"  {info['icon']} {cat}: {count} bindings")
+            return
+
+        table = Table(title="📚 Categories", box=ROUNDED)
+        table.add_column("Category", style="bold")
+        table.add_column("Bindings", justify="right")
+
+        sorted_cats = sorted(
+            by_category.keys(),
+            key=lambda c: CATEGORIES.get(c, {"order": 99})["order"]
+        )
+
+        for cat in sorted_cats:
+            info = CATEGORIES.get(cat, {"color": "white", "icon": "•"})
+            table.add_row(
+                Text(f"{info['icon']} {cat}", style=info['color']),
+                str(by_category[cat])
+            )
+
+        self.console.print(table)
+
+    def print_help(self):
+        """Print help."""
+        help_md = """
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `<query>` | Search keybindings (e.g., "split", "copy", "font") |
+| `:all` | Show all keybindings by category |
+| `:cat <name>` | Show specific category (e.g., `:cat splits`) |
+| `:list` | List all categories |
+| `:help` | Show this help |
+| `:q` | Exit |
+
+## Search Examples
+
+- **`split`** - All split-related bindings
+- **`copy`** - Copy/paste bindings
+- **`zoom`** or **`font`** - Font size bindings
+- **`navigate`** or **`goto`** - Navigation bindings
+- **`alt+h`** or **`⌥ h`** - Find what a key does
+- **`vim`** or **`hjkl`** - Vim-style bindings
+
+## Tips
+
+- Search by action: `new_split`, `goto_tab`
+- Search by concept: `bigger`, `previous`, `close`
+- Search by key: `super+d`, `alt+shift`
+"""
+        if RICH_AVAILABLE:
+            self.console.print(Panel(Markdown(help_md), title="Help", box=ROUNDED))
+        else:
+            print(help_md)
+
+    def run_interactive(self):
+        """Run interactive mode."""
+        self.print_header()
+
+        if RICH_AVAILABLE:
+            self.console.print("[dim]Type a search query, or :help for commands[/dim]\n")
+        else:
+            print("Type a search query, or :help for commands\n")
+
+        while True:
+            try:
+                if RICH_AVAILABLE:
+                    query = Prompt.ask("[bold cyan]🔍[/bold cyan]")
+                else:
+                    query = input("🔍 ")
+
+                query = query.strip()
+                if not query:
+                    continue
+
+                if query.startswith(":"):
+                    cmd = query[1:].lower().split()
+                    cmd_name = cmd[0] if cmd else ""
+
+                    if cmd_name in ("q", "quit", "exit"):
+                        break
+                    elif cmd_name == "help":
+                        self.print_help()
+                    elif cmd_name == "all":
+                        self.print_all()
+                    elif cmd_name == "list":
+                        self.print_categories()
+                    elif cmd_name == "cat" and len(cmd) > 1:
+                        cat_name = " ".join(cmd[1:]).title()
+                        cat_kbs = [kb for kb in self.keybindings
+                                   if kb.category.lower() == cat_name.lower()]
+                        if cat_kbs:
+                            self.print_category(cat_name, cat_kbs)
+                        else:
+                            print(f"Category '{cat_name}' not found. Use :list")
+                    else:
+                        print("Unknown command. Type :help")
+                else:
+                    results = semantic_search(query, self.keybindings)
+                    self.print_search_results(query, results)
+
+            except (KeyboardInterrupt, EOFError):
+                break
+
+        print("\n👻 Goodbye!")
+
+
+def main():
+    app = GhosttyKeysApp()
+
+    args = sys.argv[1:]
+
+    if not args:
+        app.run_interactive()
+    elif args[0] in ("--help", "-h"):
+        print(__doc__)
+    elif args[0] == "--list":
+        app.print_categories()
+    elif args[0] == "--all":
+        app.print_header()
+        app.print_all()
+    elif args[0] == "--cat" and len(args) > 1:
+        cat_name = args[1].title()
+        cat_kbs = [kb for kb in app.keybindings if kb.category.lower() == cat_name.lower()]
+        if cat_kbs:
+            app.print_category(cat_name, cat_kbs)
+    else:
+        query = " ".join(args)
+        results = semantic_search(query, app.keybindings)
+        app.print_search_results(query, results)
+
+
+if __name__ == "__main__":
+    main()
